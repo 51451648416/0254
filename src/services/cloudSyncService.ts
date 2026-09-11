@@ -1,0 +1,217 @@
+import { useState, useEffect, useCallback } from "react";
+import { syncApiConfigFromServer } from "./apiConfig";
+import { syncTdxKeysFromServer, getStoredTdxKeyPairs, globalTdxKeyManager } from "./tdxKeyRotator";
+import { syncLearnedParametersFromServer, getLearnedParameters } from "../estimator/modelTrainingEngine";
+import { syncDatasetFromServer, getStoredDataset } from "./datasetRepository";
+
+export interface CloudSyncState {
+  isCloudConnected: boolean; // true: Upstash Redis 連線成功
+  isServerOnline: boolean; // 後端 API 正常運行
+  keyCount: number; // 已載入之全域金鑰組數
+  modelVersion: number | string; // 全域模型版本
+  datasetCount: number; // 全域資料集筆數
+  lastSyncTime: string; // 最後同步時間
+  isSyncing: boolean; // 同步中狀態
+  syncStatusText: string; // 狀態文字
+  redisMode: "upstash_redis_cloud" | "local_memory_fallback" | "offline";
+  syncCooldown: number; // 手動同步冷卻秒數 (每 50 秒才能按一次)
+}
+
+const MANUAL_SYNC_COOLDOWN_SEC = 50;
+let lastManualSyncTimestamp = 0;
+let cooldownTickerTimer: ReturnType<typeof setInterval> | null = null;
+
+export function getRemainingSyncCooldown(): number {
+  if (!lastManualSyncTimestamp) return 0;
+  const elapsed = Math.floor((Date.now() - lastManualSyncTimestamp) / 1000);
+  return Math.max(0, MANUAL_SYNC_COOLDOWN_SEC - elapsed);
+}
+
+function startCooldownTicker() {
+  if (cooldownTickerTimer) {
+    clearInterval(cooldownTickerTimer);
+    cooldownTickerTimer = null;
+  }
+
+  const update = () => {
+    const remaining = getRemainingSyncCooldown();
+    if (globalSyncState.syncCooldown !== remaining) {
+      globalSyncState.syncCooldown = remaining;
+      notifyListeners();
+    }
+    if (remaining <= 0) {
+      if (cooldownTickerTimer) {
+        clearInterval(cooldownTickerTimer);
+        cooldownTickerTimer = null;
+      }
+    }
+  };
+
+  update();
+  cooldownTickerTimer = setInterval(update, 1000);
+}
+
+let globalSyncState: CloudSyncState = {
+  isCloudConnected: false,
+  isServerOnline: false,
+  keyCount: 0,
+  modelVersion: 2,
+  datasetCount: 0,
+  lastSyncTime: "",
+  isSyncing: false,
+  syncStatusText: "尚未進行雲端同步",
+  redisMode: "offline",
+  syncCooldown: 0,
+};
+
+const listeners = new Set<(state: CloudSyncState) => void>();
+
+function notifyListeners() {
+  for (const listener of listeners) {
+    listener({ ...globalSyncState });
+  }
+}
+
+/**
+ * 執行即時雙向全域雲端同步 (Bidirectional Cloud Synchronization)
+ */
+export async function performBidirectionalCloudSync(): Promise<CloudSyncState> {
+  globalSyncState.isSyncing = true;
+  notifyListeners();
+
+  try {
+    // 1. 檢測伺服器與 Redis 健康狀態 (支援 /api/health 與 /api/keys 探測)
+    let healthData: any = null;
+    let keysProbeSuccess = false;
+    try {
+      const [healthRes, keysRes] = await Promise.allSettled([
+        fetch("/api/health"),
+        fetch("/api/keys"),
+      ]);
+
+      if (healthRes.status === "fulfilled" && healthRes.value.ok) {
+        healthData = await healthRes.value.json();
+      }
+      if (keysRes.status === "fulfilled" && keysRes.value.ok) {
+        const kJson = await keysRes.value.json();
+        if (kJson && kJson.success) {
+          keysProbeSuccess = true;
+        }
+      }
+    } catch {}
+
+    const isServerOnline = Boolean((healthData && healthData.status === "ok") || keysProbeSuccess);
+    const isCloudConnected = Boolean((healthData && healthData.redisConnected) || keysProbeSuccess);
+    const redisMode = isCloudConnected
+      ? "upstash_redis_cloud"
+      : isServerOnline
+      ? "local_memory_fallback"
+      : "offline";
+
+    // 2. 並行拉取金鑰、模型權重、資料集與 API 配置
+    const [keysResult, modelResult, datasetResult, configResult] = await Promise.allSettled([
+      syncTdxKeysFromServer(),
+      syncLearnedParametersFromServer(),
+      syncDatasetFromServer(),
+      syncApiConfigFromServer(),
+    ]);
+
+    // 3. 取得本地最新數值與輪轉系統狀態
+    let localKeys = getStoredTdxKeyPairs();
+    let validKeyCount = localKeys.filter((k) => k.isEnabled && k.clientId && k.clientSecret).length;
+    if (validKeyCount === 0) {
+      const activeKeys = globalTdxKeyManager.getAllKeyPairs();
+      validKeyCount = activeKeys.filter((k) => k.clientId && k.clientSecret).length;
+      if (validKeyCount > 0 && typeof localStorage !== "undefined") {
+        // 自動初始化持久化，讓使用者進入介面即可檢視
+        const initialCustomKeys = activeKeys.map((k, idx) => ({
+          id: k.id || `key-init-${idx + 1}`,
+          clientId: k.clientId,
+          clientSecret: k.clientSecret,
+          label: k.label || `金鑰組 #${idx + 1}`,
+          isEnabled: true,
+        }));
+        try {
+          localStorage.setItem("TDX_API_KEYS", JSON.stringify(initialCustomKeys));
+        } catch {}
+      }
+    }
+    const currentModel = getLearnedParameters();
+    const currentDataset = getStoredDataset();
+
+    const nowFormatted = new Date().toLocaleTimeString("zh-TW", { hour12: false });
+
+    let statusText = "";
+    if (isCloudConnected) {
+      statusText = `雲端同步正常 (已載入 ${validKeyCount} 組全域金鑰 / 全域模型 v${currentModel.version || 2})`;
+    } else if (isServerOnline) {
+      statusText = `後端連線正常 (已載入 ${validKeyCount} 組有效金鑰 / 模型 v${currentModel.version || 2})`;
+    } else {
+      statusText = `單機離線快取 (${validKeyCount} 組備用金鑰)`;
+    }
+
+    globalSyncState = {
+      isCloudConnected,
+      isServerOnline,
+      keyCount: validKeyCount,
+      modelVersion: currentModel.version || 2,
+      datasetCount: currentDataset.length,
+      lastSyncTime: nowFormatted,
+      isSyncing: false,
+      syncStatusText: statusText,
+      redisMode,
+      syncCooldown: getRemainingSyncCooldown(),
+    };
+
+    // 發送全域自訂廣播事件通知 React 各頁面與元件更新
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("hsuehshan:cloud_synced", { detail: globalSyncState }));
+    }
+
+    notifyListeners();
+    return { ...globalSyncState };
+  } catch (err) {
+    console.warn("全域雲端同步失敗:", err);
+    globalSyncState.isSyncing = false;
+    notifyListeners();
+    return { ...globalSyncState };
+  }
+}
+
+/**
+ * React Hook: 取得雲端同步狀態並支援手動同步
+ */
+export function useCloudSyncStatus() {
+  const [state, setState] = useState<CloudSyncState>(() => ({ ...globalSyncState }));
+
+  useEffect(() => {
+    const handleUpdate = (newState: CloudSyncState) => {
+      setState(newState);
+    };
+    listeners.add(handleUpdate);
+
+    // Initial check
+    if (!globalSyncState.lastSyncTime) {
+      performBidirectionalCloudSync();
+    }
+
+    return () => {
+      listeners.delete(handleUpdate);
+    };
+  }, []);
+
+  const triggerManualSync = useCallback(async () => {
+    const remaining = getRemainingSyncCooldown();
+    if (remaining > 0 || globalSyncState.isSyncing) {
+      return { ...globalSyncState, syncCooldown: remaining };
+    }
+    lastManualSyncTimestamp = Date.now();
+    startCooldownTicker();
+    return await performBidirectionalCloudSync();
+  }, []);
+
+  return {
+    ...state,
+    triggerManualSync,
+  };
+}
