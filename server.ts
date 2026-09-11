@@ -13,9 +13,9 @@ import {
   HSUEHSHAN_INSPECTION_NODES,
   getInspectionNodeById,
 } from "./src/data/cctvInspectionConfig";
-import handleTdxSync from "./api/tdx/sync";
-import handleCctvStep from "./api/cctv/cross-validation/step";
-import handleTrafficOverview from "./api/traffic/overview";
+import handleTdxSync from "./_api/tdx/sync";
+import handleCctvStep from "./_api/cctv/cross-validation/step";
+import handleTrafficOverview from "./_api/traffic/overview";
 import {
   detectTunnelPeakStatus,
   getTaipeiTimeInfo,
